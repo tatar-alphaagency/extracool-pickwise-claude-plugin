@@ -10,7 +10,7 @@
     {
       "name": "pickwise",
       "description": "Pick wisely: Claude chooses the right model for each subagent (gated models such as Fable need your OK in chat, with Opus as the fallback) and uses only the Claude in Chrome browsers on the computer you are working on.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "./",
       "category": "productivity"
     }

@@ -3,7 +3,7 @@
 **Pick wisely.** A Claude Code plugin by **ExTraCooL** that makes Claude choose its resources with care:
 
 1. **Subagent models.** The main chat picks the right model for each subagent: `haiku`, `sonnet` or `opus`. It no longer copies the main chat's model by default. Expensive models such as **Fable** are gated. Claude asks you in chat first, and **Use Opus instead** is the recommended answer.
-2. **Claude in Chrome browsers.** Claude uses only the browsers on the computer you are working on, and asks you which one (Edge, Chrome...) each session. Without pickwise, the extension shows every browser of your account as "Browser 1..N", across all your computers, and the names change.
+2. **Claude in Chrome browsers.** Claude uses only the browsers on the computer you are working on, and asks you which one (Edge, Chrome...) for every task. Without pickwise, the extension shows every browser of your account as "Browser 1..N", across all your computers, and the names change.
 
 ```
 /plugin marketplace add tatar-alphaagency/extracool-pickwise-claude-plugin
@@ -116,14 +116,19 @@ A browser on another computer only shows a "can't connect" tab for a moment, and
 
 Do this on each computer. Each one keeps its own list.
 
-### Every session
+### Every task
 
-Before the first browser action, Claude asks:
+Each message you send starts a new task. Before the first browser action in a task, Claude asks:
 
 > Which browser on this computer (MY-PC) should Claude in Chrome use?
 > ○ Edge (MY-PC) ○ Chrome (MY-PC)
 
-Only this computer's browsers are offered. Browser tools stay blocked until you choose. `switch_browser`, which pings every browser on every computer, is always blocked.
+- Only this computer's browsers are offered.
+- Claude asks again for each new message, even if it used a browser earlier in the session, and even if you already named one in your message. Within one task (including its subagents) it does not ask again.
+- If the task needs both browsers, Claude asks one multi-select question.
+- Subagents cannot ask you. Claude asks in the main chat first, then hands the chosen browser to the subagent.
+- Browser tools stay blocked until you choose. A hook enforces this, so it holds even if Claude forgets to ask.
+- `switch_browser`, which pings every browser on every computer, is always blocked.
 
 ### Manage the list
 
@@ -186,7 +191,7 @@ Uninstalling leaves your data in `~/.claude/pickwise/`. Delete that folder if yo
 | Nothing changes after install | Start a new session (VS Code: Reload Window). Hooks load at session start. |
 | Fable runs with no question | Check `node --version` in the terminal. Check `claude plugin list` shows pickwise enabled. Check `config.json` does not set `"model": {"enabled": false}`. |
 | You picked "Use Fable" but Claude is still denied | The approval lasts 10 minutes and allows one call. Ask again. |
-| "no registered browser is selected" | Pick a browser when Claude asks. If none is listed, register this computer's browsers first. |
+| "no browser picked by the user is selected" or "the user has not picked this browser" | Pick a browser when Claude asks. The choice resets on every new message. If none is listed, register this computer's browsers first. |
 | Registering finds nothing | Check the extension is connected in that browser and that nothing else uses port 47831; if it does, set `probePort`. |
 | You had your own rules for this | Remove your own hooks from `~/.claude/settings.json` and your own rules from `CLAUDE.md`. Two approval guards would each consume the one-time approval. |
 
@@ -196,9 +201,10 @@ Uninstalling leaves your data in `~/.claude/pickwise/`. Delete that folder if yo
 |---|---|
 | `SessionStart` hook | Adds the model rules and this computer's browser list to Claude's context. |
 | `PreToolUse` hook on `Agent`, `Task`, `Workflow` | Denies a gated model unless there is a fresh one-time approval. The deny message tells Claude to ask you. |
-| `PostToolUse` hook on `AskUserQuestion` | When you answer **Use Fable**, it writes the one-time approval (`~/.claude/pickwise/state/`). |
-| `PreToolUse` hook on `mcp__claude-in-chrome__*` | Blocks `switch_browser`, blocks selecting unregistered browsers (except while the probe runs), and blocks browser tools until a registered browser is selected in this session. |
-| `PostToolUse` hook on `select_browser` | Remembers the selected browser for this session. |
+| `UserPromptSubmit` hook | Clears the browser choice on every new message, so each task asks again. |
+| `PostToolUse` hook on `AskUserQuestion` | When you answer **Use Fable**, it writes the one-time approval. When your answer names a registered browser, it records that pick for the current task. Both live in `~/.claude/pickwise/state/`. |
+| `PreToolUse` hook on `mcp__claude-in-chrome__*` | Blocks `switch_browser`. Blocks `select_browser` for unregistered browsers (except while the probe runs) and for browsers you did not pick in the current task. Blocks other browser tools until a picked browser is selected. |
+| `PostToolUse` hook on `select_browser` | Remembers the selected browser until your next message. |
 | `scripts/browser-probe.js` | The localhost probe and registry tool. |
 | Skills `/pickwise:model`, `/pickwise:browser` | The full rules and the registration steps, for Claude and for you. |
 
@@ -220,7 +226,7 @@ node tests/pickwise.test.js
    - **Use Opus instead (Recommended):** ทำงานต่อด้วย Opus ทันที
    - **Use Fable:** ใช้ Fable 1 ครั้ง
    - **Cancel:** ยกเลิกงานนั้น
-2. **ใช้เฉพาะ browser ของเครื่องที่ทำงานอยู่** Claude in Chrome จะแสดง browser ทุกตัวในบัญชีเป็น "Browser 1, 2, 3..." โดยไม่บอกว่าอยู่เครื่องไหน และชื่อก็เปลี่ยนไปเรื่อยๆ pickwise จะเก็บรายชื่อ browser แยกตามเครื่อง และถามทุก session ว่าจะใช้ Edge หรือ Chrome ของเครื่องนี้ตัวไหน
+2. **ใช้เฉพาะ browser ของเครื่องที่ทำงานอยู่** Claude in Chrome จะแสดง browser ทุกตัวในบัญชีเป็น "Browser 1, 2, 3..." โดยไม่บอกว่าอยู่เครื่องไหน และชื่อก็เปลี่ยนไปเรื่อยๆ pickwise จะเก็บรายชื่อ browser แยกตามเครื่อง และถามทุกครั้งที่เริ่มงานใหม่ว่าจะใช้ Edge หรือ Chrome ของเครื่องนี้ตัวไหน
 
 ### สิ่งที่ต้องมี
 
@@ -252,7 +258,7 @@ node tests/pickwise.test.js
 
 - **model:** ไม่ต้องทำอะไรเพิ่ม Claude เลือก model เอง ส่วน Fable จะถามก่อนทุกครั้ง
 - **browser ครั้งแรกบนแต่ละเครื่อง:** พิมพ์ว่า "ลงทะเบียน browser ของเครื่องนี้" Claude จะเปิดแท็บทดสอบที่ `127.0.0.1:47831` ใน browser แต่ละตัว ตัวที่เปิดได้คือ browser ของเครื่องนี้ แล้วบันทึกไว้ที่ `~/.claude/pickwise/browsers/<ชื่อเครื่อง>.json`
-- **ทุก session:** Claude จะถามว่าจะใช้ browser ตัวไหนของเครื่องนี้ก่อนเริ่มใช้งาน
+- **ทุกงาน:** ทุกข้อความใหม่ที่คุณส่งนับเป็นงานใหม่ ก่อนใช้ browser ครั้งแรกในงานนั้น Claude จะถามว่าจะใช้ browser ตัวไหนของเครื่องนี้ ถามซ้ำแม้เคยใช้ไปแล้วใน session หรือแม้คุณระบุชื่อ browser มาในข้อความแล้ว ภายในงานเดียวกัน (รวม subagent) จะไม่ถามซ้ำ hook บังคับเรื่องนี้ จึงยังทำงานแม้ Claude ลืมถาม
 
 ### ตั้งค่า
 

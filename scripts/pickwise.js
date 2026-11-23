@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 // pickwise hook entry point.
-// Usage: node pickwise.js <session-start|pre-tool|post-tool>   (hook JSON on stdin)
+// Usage: node pickwise.js <session-start|user-prompt|pre-tool|post-tool>   (hook JSON on stdin)
 //
 // session-start: injects the model and browser rules (with this computer's
 //                browser registry) into Claude's context.
+// user-prompt:   every new user message clears the browser pick and selection,
+//                so each task asks the user again which browser to use.
 // pre-tool:      Agent/Task/Workflow -> gated models (default: fable) need a
 //                one-time approval token; Claude in Chrome tools -> only
-//                browsers registered for this computer.
-// post-tool:     AskUserQuestion -> "Use <Model>" answer writes the token;
+//                browsers registered for this computer, and select_browser
+//                only for a browser the user picked in this task.
+// post-tool:     AskUserQuestion -> "Use <Model>" answer writes the token, and
+//                an answer naming a registered browser records the pick;
 //                select_browser -> remembers the selected browser per session.
 'use strict';
 const fs = require('fs');
@@ -63,6 +67,16 @@ function loadRegistry() {
 
 const cap = (s) => String(s).charAt(0).toUpperCase() + String(s).slice(1);
 const fwd = (p) => p.replace(/\\/g, '/');
+const selectedFile = (sid) => path.join(STATE_DIR, `browser-${sid}.json`);
+const pickFile = (sid) => path.join(STATE_DIR, `browser-pick-${sid}.json`);
+
+function readJson(f) {
+  try {
+    return JSON.parse(fs.readFileSync(f, 'utf8'));
+  } catch {
+    return null;
+  }
+}
 
 function ensureDir(d) {
   fs.mkdirSync(d, { recursive: true });
@@ -130,12 +144,16 @@ function browserContext(b) {
     `- This computer: \`${HOST}\`. Use only browsers registered for it (${fwd(REGISTRY)}):`,
     list,
     '- Names like "Browser 1" change between sessions: go by deviceId only. Never call `switch_browser`.',
-    '- Before the first Claude in Chrome action in a session: call `list_connected_browsers`, keep the registered',
-    '  browsers that are connected, ask the user with AskUserQuestion which one to use (label from the list above,',
-    '  deviceId in the description), then `select_browser` it. Ask again only if the user wants to change browser.',
+    '- Before the first Claude in Chrome action of EVERY user message (each new task), even if a browser was used',
+    '  earlier or the user already named one: call `list_connected_browsers`, keep the registered browsers that are',
+    '  connected, ask the user with AskUserQuestion which one to use (option label exactly as in the list above,',
+    '  deviceId in the description; multiSelect if the task needs more than one browser), then `select_browser` it.',
+    '- Subagents cannot ask the user: ask in the main chat first, then give the subagent the chosen deviceId.',
     '- None registered or none connected: stop, tell the user, and offer the `pickwise:browser` skill to register.',
     `- Registration uses the probe script \`${PROBE_SCRIPT}\` on port ${b.probePort} (see the pickwise:browser skill).`,
-    '- A pickwise hook blocks Claude in Chrome tools until a registered browser is selected in this session.',
+    '- A pickwise hook clears the browser choice on every new user message. It blocks `select_browser` unless the user',
+    '  picked that browser in an AskUserQuestion during the current message, and blocks other Claude in Chrome tools',
+    '  until such a browser is selected.',
   ].join('\n');
 }
 
@@ -213,25 +231,25 @@ async function preTool(cfg, input) {
     if (tool === 'switch_browser') {
       deny('switch_browser is blocked: it can reach browsers on other computers. Use list_connected_browsers, ask the user, then select_browser.');
     }
+    const ask =
+      'Call list_connected_browsers, ask the user with AskUserQuestion which registered browser of ' +
+      `${HOST} to use (option label exactly as registered, e.g. "${(reg[0] && reg[0].label) || `Edge (${HOST})`}"), then select_browser it.`;
     if (tool === 'select_browser') {
       const id = String((input.tool_input || {}).deviceId || '');
-      if (known(id) || registering) process.exit(0);
-      deny(
-        `deviceId ${id} is not registered for this computer (${HOST}). Pick one from the registered list and ask the user, ` +
-          'or register browsers with the pickwise:browser skill.'
-      );
+      if (registering) process.exit(0);
+      if (!known(id)) {
+        deny(
+          `deviceId ${id} is not registered for this computer (${HOST}). Pick one from the registered list and ask the user, ` +
+            'or register browsers with the pickwise:browser skill.'
+        );
+      }
+      const picks = (readJson(pickFile(input.session_id)) || {}).deviceIds || [];
+      if (picks.includes(id)) process.exit(0);
+      deny(`the user has not picked this browser for the current message. The choice resets on every new message. ${ask}`);
     }
-    let selected = '';
-    try {
-      selected = JSON.parse(fs.readFileSync(path.join(STATE_DIR, `browser-${input.session_id}.json`), 'utf8')).deviceId;
-    } catch {
-      // nothing selected this session
-    }
+    const selected = (readJson(selectedFile(input.session_id)) || {}).deviceId || '';
     if (known(selected) || registering) process.exit(0);
-    deny(
-      'no registered browser is selected in this session. Call list_connected_browsers, ask the user with AskUserQuestion ' +
-        `which registered browser of ${HOST} to use, then select_browser it.`
-    );
+    deny(`no browser picked by the user is selected for the current message. ${ask}`);
   }
   process.exit(0);
 }
@@ -254,8 +272,8 @@ function answerValues(input) {
 
 function postTool(cfg, input) {
   const name = String(input.tool_name || '');
+  const vals = name === 'AskUserQuestion' ? answerValues(input).map((v) => v.toLowerCase()) : [];
   if (cfg.model.enabled && name === 'AskUserQuestion') {
-    const vals = answerValues(input).map((v) => v.toLowerCase());
     for (const g of cfg.model.gatedModels.map((x) => x.toLowerCase())) {
       if (vals.includes(`use ${g}`)) {
         ensureDir(STATE_DIR);
@@ -263,14 +281,41 @@ function postTool(cfg, input) {
       }
     }
   }
+  if (cfg.browser.enabled && name === 'AskUserQuestion' && input.session_id) {
+    // An answer that contains a registered label or deviceId is a pick
+    // (multiSelect answers arrive joined, so match by substring).
+    const hits = loadRegistry()
+      .filter((b) => vals.some((v) => v.includes(String(b.label).toLowerCase()) || v.includes(String(b.deviceId).toLowerCase())))
+      .map((b) => b.deviceId);
+    if (hits.length) {
+      const prev = (readJson(pickFile(input.session_id)) || {}).deviceIds || [];
+      ensureDir(STATE_DIR);
+      fs.writeFileSync(
+        pickFile(input.session_id),
+        JSON.stringify({ deviceIds: [...new Set([...prev, ...hits])], at: Date.now() })
+      );
+    }
+  }
   if (cfg.browser.enabled && name === `${CHROME}select_browser`) {
     const id = String((input.tool_input || {}).deviceId || '');
     if (id && input.session_id) {
       ensureDir(STATE_DIR);
-      fs.writeFileSync(
-        path.join(STATE_DIR, `browser-${input.session_id}.json`),
-        JSON.stringify({ deviceId: id, at: Date.now() })
-      );
+      fs.writeFileSync(selectedFile(input.session_id), JSON.stringify({ deviceId: id, at: Date.now() }));
+    }
+  }
+  process.exit(0);
+}
+
+// ---------- user-prompt ----------
+
+function userPrompt(cfg, input) {
+  if (cfg.browser.enabled && input.session_id) {
+    for (const f of [pickFile(input.session_id), selectedFile(input.session_id)]) {
+      try {
+        fs.unlinkSync(f);
+      } catch {
+        // nothing to clear
+      }
     }
   }
   process.exit(0);
@@ -291,6 +336,7 @@ process.stdin.on('end', () => {
   const mode = process.argv[2];
   try {
     if (mode === 'session-start') return sessionStart(cfg);
+    if (mode === 'user-prompt') return userPrompt(cfg, input);
     if (mode === 'pre-tool') return preTool(cfg, input).catch(() => process.exit(0));
     if (mode === 'post-tool') return postTool(cfg, input);
   } catch {
