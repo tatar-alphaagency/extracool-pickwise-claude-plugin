@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "extracool",
+  "description": "Claude Code plugins by ExTraCooL.",
+  "owner": {
+    "name": "ExTraCooL",
+    "url": "https://github.com/tatar-alphaagency"
+  },
+  "plugins": [
+    {
+      "name": "pickwise",
+      "description": "Pick wisely: Claude chooses the right model for each subagent (gated models such as Fable need your OK in chat, with Opus as the fallback) and uses only the Claude in Chrome browsers on the computer you are working on.",
+      "version": "1.0.0",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
