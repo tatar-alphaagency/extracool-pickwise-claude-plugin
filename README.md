@@ -3,7 +3,8 @@
 **Pick wisely.** A Claude Code plugin by **ExTraCooL** that makes Claude choose its resources with care:
 
 1. **Subagent models.** The main chat picks the right model for each subagent: `haiku`, `sonnet` or `opus`. It no longer copies the main chat's model by default. Expensive models such as **Fable** are gated. Claude asks you in chat first, and **Use Opus instead** is the recommended answer.
-2. **Claude in Chrome browsers.** Claude uses only the browsers on the computer you are working on, and asks you which one (Edge, Chrome...) for every task. Without pickwise, the extension shows every browser of your account as "Browser 1..N", across all your computers, and the names change.
+2. **Parallel subagents.** Independent subagent tasks run at the same time, up to a limit (`maxParallel`, default 4). A hook denies the subagent past the limit until one finishes.
+3. **Claude in Chrome browsers.** Claude uses only the browsers on the computer you are working on, and asks you which one (Edge, Chrome...) for every task. Without pickwise, the extension shows every browser of your account as "Browser 1..N", across all your computers, and the names change.
 
 ```
 /plugin marketplace add tatar-alphaagency/extracool-pickwise-claude-plugin
@@ -19,6 +20,7 @@
 - [Install: Claude Code in a terminal](#install-claude-code-in-a-terminal)
 - [Install: VS Code](#install-vs-code)
 - [Use: subagent models](#use-subagent-models)
+- [Use: parallel subagents](#use-parallel-subagents)
 - [Use: browsers](#use-browsers)
 - [Settings](#settings)
 - [Update and uninstall](#update-and-uninstall)
@@ -29,6 +31,7 @@
 ## Why
 
 - **Slow, expensive subagents.** A subagent with no model set inherits the main chat's model. If you chat on Opus or Fable, a simple file search also runs on Opus or Fable. pickwise has Claude set the model on every Agent call and every Workflow `agent()`, using the cheapest model that does the job well.
+- **Subagents run one by one.** Claude often waits for one subagent before it starts the next, even when the tasks do not depend on each other. pickwise tells Claude to launch independent tasks together, and caps how many run at once, so a burst of subagents does not eat your token budget and rate limit.
 - **Fable by accident.** Fable is never used without your OK. Claude explains why Opus is not enough, and you choose:
 
   | Option | What happens |
@@ -98,6 +101,15 @@ When a task seems to need Fable, Claude asks first, as shown in [Why](#why). Eac
 
 To read the rules in chat, type `/pickwise:model`.
 
+## Use: parallel subagents
+
+There is nothing to type. When tasks are independent, Claude sends their subagents in one message, so they run at the same time, each with its own model. For example: three `haiku` searches at once, then one `sonnet` to implement.
+
+- Tasks that need another task's result still wait for it.
+- Two subagents that edit the same files never run at the same time, unless each has its own git worktree.
+- At most `maxParallel` subagents (default **4**) run at once in a session. The next Agent call is denied until one finishes. Each session has its own count.
+- Workflow scripts are not counted by the hook. Claude is told to keep at most `maxParallel` `agent()` calls running at once.
+
 ## Use: browsers
 
 ### First time on each computer: register its browsers
@@ -159,11 +171,18 @@ Optional file: `~/.claude/pickwise/config.json`. Any key you leave out keeps its
   "browser": {
     "enabled": true,
     "probePort": 47831
+  },
+  "parallel": {
+    "enabled": true,
+    "maxParallel": 4,
+    "slotMinutes": 60
   }
 }
 ```
 
-- To use only one part, set `"enabled": false` for the other.
+- To turn a part off, set `"enabled": false` in it.
+- `maxParallel`: the most subagents that run at once in one session. Lower it if you hit rate limits; raise it on a plan with more headroom.
+- `slotMinutes`: a subagent whose end the hook never saw (a crash, a stopped task) frees its place after this many minutes. Keep it longer than your longest subagent.
 - `gatedModels` matches parts of the model name: `"fable"` gates any Fable model. You can add `"opus"` to gate Opus too; then set `fallbackModel` to `"sonnet"`.
 - Start a new session after you change the file.
 
@@ -193,6 +212,7 @@ Uninstalling leaves your data in `~/.claude/pickwise/`. Delete that folder if yo
 | You picked "Use Fable" but Claude is still denied | The approval lasts 10 minutes and allows one call. Ask again. |
 | "no browser picked by the user is selected" or "the user has not picked this browser" | Pick a browser when Claude asks. The choice resets on every new message. If none is listed, register this computer's browsers first. |
 | Registering finds nothing | Check the extension is connected in that browser and that nothing else uses port 47831; if it does, set `probePort`. |
+| "N subagents are already running in this session" | Wait for a running subagent to finish, or raise `maxParallel`. If none is running, a place was not freed: it frees itself after `slotMinutes`, or delete `~/.claude/pickwise/state/slot-*`. |
 | You had your own rules for this | Remove your own hooks from `~/.claude/settings.json` and your own rules from `CLAUDE.md`. Two approval guards would each consume the one-time approval. |
 
 ## How it works
@@ -201,6 +221,8 @@ Uninstalling leaves your data in `~/.claude/pickwise/`. Delete that folder if yo
 |---|---|
 | `SessionStart` hook | Adds the model rules and this computer's browser list to Claude's context. |
 | `PreToolUse` hook on `Agent`, `Task`, `Workflow` | Denies a gated model unless there is a fresh one-time approval. The deny message tells Claude to ask you. |
+| `PreToolUse` hook on `Agent`, `Task` | Takes one of `maxParallel` places for the session (one file per place, created atomically, so calls sent together cannot share one). No free place: deny. |
+| `PostToolUse`, `PostToolUseFailure`, `PermissionDenied` hooks on `Agent`, `Task`; `SubagentStop` hook | Free the place: a foreground call when it returns or fails, a background one when `SubagentStop` names its `agentId`. |
 | `UserPromptSubmit` hook | Clears the browser choice on every new message, so each task asks again. |
 | `PostToolUse` hook on `AskUserQuestion` | When you answer **Use Fable**, it writes the one-time approval. When your answer names a registered browser, it records that pick for the current task. Both live in `~/.claude/pickwise/state/`. |
 | `PreToolUse` hook on `mcp__claude-in-chrome__*` | Blocks `switch_browser`. Blocks `select_browser` for unregistered browsers (except while the probe runs) and for browsers you did not pick in the current task. Blocks other browser tools until a picked browser is selected. |
@@ -226,7 +248,8 @@ node tests/pickwise.test.js
    - **Use Opus instead (Recommended):** ทำงานต่อด้วย Opus ทันที
    - **Use Fable:** ใช้ Fable 1 ครั้ง
    - **Cancel:** ยกเลิกงานนั้น
-2. **ใช้เฉพาะ browser ของเครื่องที่ทำงานอยู่** Claude in Chrome จะแสดง browser ทุกตัวในบัญชีเป็น "Browser 1, 2, 3..." โดยไม่บอกว่าอยู่เครื่องไหน และชื่อก็เปลี่ยนไปเรื่อยๆ pickwise จะเก็บรายชื่อ browser แยกตามเครื่อง และถามทุกครั้งที่เริ่มงานใหม่ว่าจะใช้ Edge หรือ Chrome ของเครื่องนี้ตัวไหน
+2. **ให้ subagent ทำงานขนานกัน** งานที่ไม่ขึ้นต่อกัน Claude จะส่ง subagent ไปพร้อมกัน แต่ละตัวยังใช้ model ของตัวเอง โดยจำกัดจำนวนที่รันพร้อมกันไว้ (`maxParallel` ค่าเริ่มต้น 4) ตัวที่เกินจะถูก hook ปฏิเสธจนกว่าจะมีตัวหนึ่งทำงานเสร็จ
+3. **ใช้เฉพาะ browser ของเครื่องที่ทำงานอยู่** Claude in Chrome จะแสดง browser ทุกตัวในบัญชีเป็น "Browser 1, 2, 3..." โดยไม่บอกว่าอยู่เครื่องไหน และชื่อก็เปลี่ยนไปเรื่อยๆ pickwise จะเก็บรายชื่อ browser แยกตามเครื่อง และถามทุกครั้งที่เริ่มงานใหม่ว่าจะใช้ Edge หรือ Chrome ของเครื่องนี้ตัวไหน
 
 ### สิ่งที่ต้องมี
 
@@ -257,6 +280,7 @@ node tests/pickwise.test.js
 ### ใช้งาน
 
 - **model:** ไม่ต้องทำอะไรเพิ่ม Claude เลือก model เอง ส่วน Fable จะถามก่อนทุกครั้ง
+- **ขนาน:** ไม่ต้องทำอะไรเพิ่ม งานที่ต้องรอผลของงานอื่นจะยังรันตามลำดับ และ subagent ที่แก้ไฟล์ชุดเดียวกันจะไม่รันพร้อมกัน
 - **browser ครั้งแรกบนแต่ละเครื่อง:** พิมพ์ว่า "ลงทะเบียน browser ของเครื่องนี้" Claude จะเปิดแท็บทดสอบที่ `127.0.0.1:47831` ใน browser แต่ละตัว ตัวที่เปิดได้คือ browser ของเครื่องนี้ แล้วบันทึกไว้ที่ `~/.claude/pickwise/browsers/<ชื่อเครื่อง>.json`
 - **ทุกงาน:** ทุกข้อความใหม่ที่คุณส่งนับเป็นงานใหม่ ก่อนใช้ browser ครั้งแรกในงานนั้น Claude จะถามว่าจะใช้ browser ตัวไหนของเครื่องนี้ ถามซ้ำแม้เคยใช้ไปแล้วใน session หรือแม้คุณระบุชื่อ browser มาในข้อความแล้ว ภายในงานเดียวกัน (รวม subagent) จะไม่ถามซ้ำ hook บังคับเรื่องนี้ จึงยังทำงานแม้ Claude ลืมถาม
 
@@ -267,6 +291,7 @@ node tests/pickwise.test.js
 - ปิดส่วนใดส่วนหนึ่ง: ตั้ง `"enabled": false`
 - เปลี่ยน model ที่ต้องขออนุมัติ: แก้ `gatedModels`
 - เปลี่ยน model ที่ใช้แทน: แก้ `fallbackModel`
+- เปลี่ยนจำนวน subagent ที่รันพร้อมกันได้: แก้ `parallel.maxParallel` (ค่าเริ่มต้น 4)
 
 แก้แล้วต้องเปิด session ใหม่
 

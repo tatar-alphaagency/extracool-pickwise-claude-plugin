@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // pickwise hook entry point.
-// Usage: node pickwise.js <session-start|user-prompt|pre-tool|post-tool>   (hook JSON on stdin)
+// Usage: node pickwise.js <session-start|user-prompt|pre-tool|post-tool|tool-failed|subagent-stop>
+//        (hook JSON on stdin)
 //
 // session-start: injects the model and browser rules (with this computer's
 //                browser registry) into Claude's context.
@@ -10,9 +11,15 @@
 //                one-time approval token; Claude in Chrome tools -> only
 //                browsers registered for this computer, and select_browser
 //                only for a browser the user picked in this task.
+//                Agent/Task also claim one of maxParallel slots per session;
+//                no free slot -> deny until a running subagent finishes.
 // post-tool:     AskUserQuestion -> "Use <Model>" answer writes the token, and
 //                an answer naming a registered browser records the pick;
-//                select_browser -> remembers the selected browser per session.
+//                select_browser -> remembers the selected browser per session;
+//                Agent/Task -> a finished foreground call frees its slot, a
+//                background launch tags its slot with the agentId.
+// tool-failed:   PostToolUseFailure / PermissionDenied on Agent/Task -> frees the slot.
+// subagent-stop: a background subagent finished -> frees the slot with its agentId.
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -40,6 +47,7 @@ const DEFAULTS = {
     },
   },
   browser: { enabled: true, probePort: 47831 },
+  parallel: { enabled: true, maxParallel: 4, slotMinutes: 60 },
 };
 
 function loadConfig() {
@@ -53,6 +61,7 @@ function loadConfig() {
   return {
     model: { ...DEFAULTS.model, ...um, routing: { ...DEFAULTS.model.routing, ...(um.routing || {}) } },
     browser: { ...DEFAULTS.browser, ...(user.browser || {}) },
+    parallel: { ...DEFAULTS.parallel, ...(user.parallel || {}) },
   };
 }
 
@@ -69,6 +78,9 @@ const cap = (s) => String(s).charAt(0).toUpperCase() + String(s).slice(1);
 const fwd = (p) => p.replace(/\\/g, '/');
 const selectedFile = (sid) => path.join(STATE_DIR, `browser-${sid}.json`);
 const pickFile = (sid) => path.join(STATE_DIR, `browser-pick-${sid}.json`);
+const slotFile = (sid, i) => path.join(STATE_DIR, `slot-${sid}-${i}.json`);
+const stoppedFile = (agentId) => path.join(STATE_DIR, `stopped-${agentId}`);
+const maxSlots = (p) => Math.max(1, Math.floor(Number(p.maxParallel) || 1));
 
 function readJson(f) {
   try {
@@ -108,6 +120,67 @@ function portOpen(port) {
     s.on('connect', () => done(true));
     s.on('error', () => done(false));
   });
+}
+
+// ---------- parallel slots ----------
+// One file per running subagent: slot-<session>-<i>.json, i < maxParallel.
+// Exclusive create ('wx') makes a claim atomic, so Agent calls sent in one
+// message (their hooks run at the same time) cannot take the same slot.
+
+function slotFiles() {
+  try {
+    return fs
+      .readdirSync(STATE_DIR)
+      .filter((f) => f.startsWith('slot-'))
+      .map((f) => path.join(STATE_DIR, f));
+  } catch {
+    return [];
+  }
+}
+
+function claimSlot(p, sid, toolUseId) {
+  ensureDir(STATE_DIR);
+  const ttl = Number(p.slotMinutes) * 60 * 1000;
+  for (let i = 0; i < maxSlots(p); i++) {
+    const f = slotFile(sid, i);
+    try {
+      // a slot older than slotMinutes was never freed (crash, stopped task): reuse it
+      if (Date.now() - fs.statSync(f).mtimeMs > ttl) fs.unlinkSync(f);
+    } catch {
+      // free slot
+    }
+    try {
+      fs.writeFileSync(f, JSON.stringify({ toolUseId, at: Date.now() }), { flag: 'wx' });
+      return true;
+    } catch {
+      // taken
+    }
+  }
+  return false;
+}
+
+function releaseSlots(match) {
+  for (const f of slotFiles()) {
+    const s = readJson(f);
+    if (s && match(s)) {
+      try {
+        fs.unlinkSync(f);
+      } catch {
+        // already freed
+      }
+    }
+  }
+}
+
+function tagSlot(toolUseId, agentId) {
+  if (fs.existsSync(stoppedFile(agentId))) {
+    // the subagent already finished before its launch result arrived
+    return releaseSlots((s) => s.toolUseId === toolUseId);
+  }
+  for (const f of slotFiles()) {
+    const s = readJson(f);
+    if (s && s.toolUseId === toolUseId) fs.writeFileSync(f, JSON.stringify({ ...s, agentId }));
+  }
 }
 
 // ---------- session-start ----------
@@ -157,6 +230,21 @@ function browserContext(b) {
   ].join('\n');
 }
 
+function parallelContext(p) {
+  const n = maxSlots(p);
+  return [
+    '## pickwise: parallel subagents',
+    "- Independent tasks (none needs another's result, no two edit the same files): send all their Agent calls in ONE",
+    '  message, so they run at the same time. Each call still sets its own `model`.',
+    "- A task that needs another task's result: wait for that result first.",
+    '- Two subagents that edit the same files: never at the same time. Run them one after the other, or give each',
+    '  `isolation: "worktree"`.',
+    `- At most ${n} subagents run at once in this session. A pickwise hook denies the Agent call past ${n}. Then wait`,
+    '  for a running subagent to finish and retry, or do that work yourself.',
+    `- In a Workflow script, keep at most ${n} agent() calls running at once.`,
+  ].join('\n');
+}
+
 function sessionStart(cfg) {
   // drop old per-session state (older than 3 days)
   try {
@@ -170,6 +258,7 @@ function sessionStart(cfg) {
   }
   const parts = [];
   if (cfg.model.enabled) parts.push(modelContext(cfg.model));
+  if (cfg.parallel.enabled) parts.push(parallelContext(cfg.parallel));
   if (cfg.browser.enabled) parts.push(browserContext(cfg.browser));
   if (!parts.length) process.exit(0);
   out({
@@ -208,11 +297,23 @@ function consumeToken(model, minutes) {
 async function preTool(cfg, input) {
   const name = String(input.tool_name || '');
 
-  if (cfg.model.enabled && ['Agent', 'Task', 'Workflow'].includes(name)) {
+  if (['Agent', 'Task', 'Workflow'].includes(name)) {
+    const p = cfg.parallel;
+    const toolUseId = String(input.tool_use_id || `none-${process.pid}-${Date.now()}`);
+    const counted = p.enabled && name !== 'Workflow';
+    if (counted && !claimSlot(p, input.session_id || 'none', toolUseId)) {
+      const n = maxSlots(p);
+      deny(
+        `${n} subagents are already running in this session (maxParallel ${n}). Wait for one to finish, then retry this call, ` +
+          'or do this work yourself. Change the limit with "parallel": {"maxParallel": N} in ~/.claude/pickwise/config.json.'
+      );
+    }
+    if (!cfg.model.enabled) process.exit(0);
     const m = cfg.model;
     const gated = m.gatedModels.map((g) => g.toLowerCase());
     const hit = requestedGated(input, gated);
     if (!hit || consumeToken(hit, m.approvalMinutes)) process.exit(0);
+    if (counted) releaseSlots((s) => s.toolUseId === toolUseId);
     deny(
       `${cap(hit)} needs the user's approval in chat first. Call AskUserQuestion: say why ${m.fallbackModel} is not enough, ` +
         `options exactly "Use ${cap(m.fallbackModel)} instead (Recommended)", "Use ${cap(hit)}", "Cancel". ` +
@@ -296,12 +397,43 @@ function postTool(cfg, input) {
       );
     }
   }
+  if (cfg.parallel.enabled && (name === 'Agent' || name === 'Task') && input.tool_use_id) {
+    const id = String(input.tool_use_id);
+    const tr = input.tool_response;
+    const text = typeof tr === 'string' ? tr : JSON.stringify(tr || '');
+    if (/async_launched/.test(text)) {
+      // background launch: the slot stays taken until SubagentStop names this agentId
+      const agentId =
+        (tr && typeof tr === 'object' && tr.agentId) || (text.match(/agentId\W+([A-Za-z0-9_-]+)/) || [])[1];
+      if (agentId) tagSlot(id, String(agentId));
+    } else {
+      releaseSlots((s) => s.toolUseId === id);
+    }
+  }
   if (cfg.browser.enabled && name === `${CHROME}select_browser`) {
     const id = String((input.tool_input || {}).deviceId || '');
     if (id && input.session_id) {
       ensureDir(STATE_DIR);
       fs.writeFileSync(selectedFile(input.session_id), JSON.stringify({ deviceId: id, at: Date.now() }));
     }
+  }
+  process.exit(0);
+}
+
+function toolFailed(cfg, input) {
+  if (cfg.parallel.enabled && input.tool_use_id) {
+    const id = String(input.tool_use_id);
+    releaseSlots((s) => s.toolUseId === id);
+  }
+  process.exit(0);
+}
+
+function subagentStop(cfg, input) {
+  const agentId = String(input.agent_id || '');
+  if (cfg.parallel.enabled && agentId) {
+    ensureDir(STATE_DIR);
+    fs.writeFileSync(stoppedFile(agentId), String(Date.now()));
+    releaseSlots((s) => s.agentId === agentId);
   }
   process.exit(0);
 }
@@ -339,6 +471,8 @@ process.stdin.on('end', () => {
     if (mode === 'user-prompt') return userPrompt(cfg, input);
     if (mode === 'pre-tool') return preTool(cfg, input).catch(() => process.exit(0));
     if (mode === 'post-tool') return postTool(cfg, input);
+    if (mode === 'tool-failed') return toolFailed(cfg, input);
+    if (mode === 'subagent-stop') return subagentStop(cfg, input);
   } catch {
     // never break the session on a hook error
   }

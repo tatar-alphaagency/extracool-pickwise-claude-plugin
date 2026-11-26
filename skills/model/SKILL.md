@@ -1,6 +1,6 @@
 ---
 name: model
-description: Use before delegating to a subagent (Agent tool) or writing a Workflow script, to pick haiku, sonnet or opus for each task, and when a gated model such as Fable seems needed or a pickwise hook denied a Fable call. Also for changing pickwise model settings.
+description: Use before delegating to a subagent (Agent tool) or writing a Workflow script, to pick haiku, sonnet or opus for each task and to run independent tasks in parallel, and when a gated model such as Fable seems needed or a pickwise hook denied a Fable call. Also for changing pickwise model settings.
 ---
 
 # pickwise: pick the subagent model
@@ -18,6 +18,14 @@ Main chat chooses the model for every subagent. The cheapest model that does the
 - Set `model` on every Agent call and on every `agent()` in a Workflow script. Never leave it to inherit the main chat model.
 - A few tool calls of work: do it yourself, do not spawn a subagent.
 - The pickwise session context shows the routing actually in force (the user can change it, see Settings).
+
+## Parallel
+
+- Independent tasks (none needs another's result, no two edit the same files): send all their Agent calls in one message. They run at the same time. Each call sets its own `model`.
+- A task that needs another task's result: wait for that result first.
+- Two subagents that edit the same files: run them one after the other, or give each `isolation: "worktree"`.
+- At most `maxParallel` subagents (default 4) run at once in a session. The pickwise hook denies the call past the limit. Then wait for a running subagent to finish and retry, or do the work yourself.
+- Workflow scripts: keep at most `maxParallel` `agent()` calls running at once. The hook does not count them.
 
 ## Gated models (default: `fable`)
 
@@ -46,7 +54,8 @@ Optional file `~/.claude/pickwise/config.json`. Missing keys keep their defaults
     "fallbackModel": "opus",
     "approvalMinutes": 10,
     "routing": { "haiku": "...", "sonnet": "...", "opus": "..." }
-  }
+  },
+  "parallel": { "enabled": true, "maxParallel": 4, "slotMinutes": 60 }
 }
 ```
 

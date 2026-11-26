@@ -22,6 +22,7 @@ const check = (name, got, want) => {
 const ctx = JSON.parse(run('session-start', {})).hookSpecificOutput.additionalContext;
 check('session-start has model rules', ctx.includes('pickwise: subagent models'), true);
 check('session-start has browser rules', ctx.includes('(none registered yet)'), true);
+check('session-start has parallel rules (default 4)', ctx.includes('At most 4 subagents run at once'), true);
 
 check('fable without token', decision(run('pre-tool', { ...S, tool_name: 'Agent', tool_input: { model: 'fable' } })), 'deny');
 run('post-tool', { ...S, tool_name: 'AskUserQuestion', tool_input: {}, tool_response: 'User answered: "q"="Use Opus instead (Recommended)"' });
@@ -81,7 +82,54 @@ setTimeout(async () => {
   check('answer naming the deviceId picks it', sel('s1'), 'allow');
   const ctx2 = JSON.parse(run('session-start', {})).hookSpecificOutput.additionalContext;
   check('session-start lists registered browser', ctx2.includes(ID), true);
-  fs.writeFileSync(cfg, JSON.stringify({ model: { enabled: false }, browser: { enabled: false, probePort: 47899 } }));
+  // parallel slots: own session, limit 2
+  fs.writeFileSync(cfg, JSON.stringify({ parallel: { maxParallel: 2 }, browser: { probePort: 47899 } }));
+  const P1 = { session_id: 'p1' };
+  const agent = (id, model = 'haiku') => decision(run('pre-tool', { ...P1, tool_name: 'Agent', tool_use_id: id, tool_input: { model } }));
+  check('session-start shows maxParallel 2', JSON.parse(run('session-start', {})).hookSpecificOutput.additionalContext.includes('At most 2 subagents'), true);
+  check('agent 1 of 2', agent('t1'), 'allow');
+  check('agent 2 of 2', agent('t2'), 'allow');
+  check('agent 3 over the limit', agent('t3'), 'deny');
+  check('other session has its own slots', decision(run('pre-tool', { session_id: 'p2', tool_name: 'Agent', tool_use_id: 'q1', tool_input: { model: 'haiku' } })), 'allow');
+  check('workflow is not counted', decision(run('pre-tool', { ...P1, tool_name: 'Workflow', tool_use_id: 'w1', tool_input: { script: "agent(p,{model:'haiku'})" } })), 'allow');
+  run('post-tool', { ...P1, tool_name: 'Agent', tool_use_id: 't1', tool_input: {}, tool_response: { status: 'completed', agentId: 'a1', content: [] } });
+  check('foreground finish frees a slot', agent('t3'), 'allow');
+  check('full again', agent('t4'), 'deny');
+  run('post-tool', { ...P1, tool_name: 'Agent', tool_use_id: 't2', tool_input: {}, tool_response: { status: 'async_launched', agentId: 'bg2' } });
+  check('background launch keeps its slot', agent('t4'), 'deny');
+  run('subagent-stop', { ...P1, agent_id: 'other' });
+  check('unrelated SubagentStop frees nothing', agent('t4'), 'deny');
+  run('subagent-stop', { ...P1, agent_id: 'bg2' });
+  check('SubagentStop of that agent frees it', agent('t4'), 'allow');
+  run('tool-failed', { ...P1, tool_name: 'Agent', tool_use_id: 't4', error: 'boom' });
+  check('failed call frees its slot', agent('t5'), 'allow');
+  run('subagent-stop', { ...P1, agent_id: 'fast' });
+  run('post-tool', { ...P1, tool_name: 'Agent', tool_use_id: 't5', tool_input: {}, tool_response: 'status: async_launched, agentId: fast' });
+  check('stop before launch result still frees', agent('t6'), 'allow');
+  check('full before the gated test', agent('t7'), 'deny');
+  run('post-tool', { ...P1, tool_name: 'Agent', tool_use_id: 't6', tool_input: {}, tool_response: { status: 'completed' } });
+  check('fable without token denied', agent('t7', 'fable'), 'deny');
+  check('slot not lost to the gated deny', agent('t8'), 'allow');
+  const old = (Date.now() - 2 * 3600 * 1000) / 1000;
+  for (const f of fs.readdirSync(path.join(T, '.claude/pickwise/state')).filter((f) => f.startsWith('slot-p1-'))) {
+    fs.utimesSync(path.join(T, '.claude/pickwise/state', f), old, old);
+  }
+  check('stale slots are reused', agent('t9'), 'allow');
+  const at = (id) =>
+    new Promise((r) => {
+      let o = '';
+      const c = require('child_process').spawn('node', [`${P}/pickwise.js`, 'pre-tool'], { env });
+      c.stdout.on('data', (d) => (o += d));
+      c.on('close', () => r(decision(o)));
+      c.stdin.end(JSON.stringify({ session_id: 'c1', tool_name: 'Agent', tool_use_id: id, tool_input: { model: 'haiku' } }));
+    });
+  const burst = await Promise.all(['c1', 'c2', 'c3', 'c4', 'c5'].map(at));
+  check('5 calls at once, limit 2: 2 allowed', burst.filter((d) => d === 'allow').length, 2);
+  fs.writeFileSync(cfg, JSON.stringify({ parallel: { enabled: false }, browser: { probePort: 47899 } }));
+  check('parallel disabled: no limit', agent('t10') === 'allow' && agent('t11') === 'allow' && agent('t12') === 'allow', true);
+  check('parallel disabled: no rules', JSON.parse(run('session-start', {})).hookSpecificOutput.additionalContext.includes('parallel subagents'), false);
+
+  fs.writeFileSync(cfg, JSON.stringify({ model: { enabled: false }, browser: { enabled: false, probePort: 47899 }, parallel: { enabled: false } }));
   check('disabled: fable passes', decision(run('pre-tool', { ...S, tool_name: 'Agent', tool_input: { model: 'fable' } })), 'allow');
   check('disabled: session-start silent', run('session-start', {}), '');
   console.log(fail ? `\n${fail} FAILED` : '\nALL PASS');

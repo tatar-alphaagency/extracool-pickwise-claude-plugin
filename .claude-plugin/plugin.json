@@ -1,7 +1,7 @@
 {
   "name": "pickwise",
-  "version": "1.1.0",
-  "description": "Pick wisely: Claude chooses the right model for each subagent (gated models such as Fable need your OK in chat, with Opus as the fallback) and uses only the Claude in Chrome browsers on the computer you are working on.",
+  "version": "1.2.0",
+  "description": "Pick wisely: Claude chooses the right model for each subagent (gated models such as Fable need your OK in chat, with Opus as the fallback), runs independent subagents in parallel up to a limit (default 4) and uses only the Claude in Chrome browsers on the computer you are working on.",
   "author": {
     "name": "ExTraCooL",
     "url": "https://github.com/tatar-alphaagency"
@@ -9,7 +9,7 @@
   "homepage": "https://github.com/tatar-alphaagency/extracool-pickwise-claude-plugin",
   "repository": "https://github.com/tatar-alphaagency/extracool-pickwise-claude-plugin",
   "license": "MIT",
-  "keywords": ["subagent", "model", "routing", "fable", "opus", "claude-in-chrome", "browser", "hooks"],
+  "keywords": ["subagent", "model", "routing", "parallel", "fable", "opus", "claude-in-chrome", "browser", "hooks"],
   "hooks": {
     "SessionStart": [
       {
@@ -48,11 +48,46 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "AskUserQuestion|mcp__claude-in-chrome__select_browser",
+        "matcher": "AskUserQuestion|Agent|Task|mcp__claude-in-chrome__select_browser",
         "hooks": [
           {
             "type": "command",
             "command": "command -v node >/dev/null 2>&1 || exit 0; R=$(printf %s \"${CLAUDE_PLUGIN_ROOT}\" | sed 's|^/\\([a-zA-Z]\\)/|\\1:/|'); node \"$R/scripts/pickwise.js\" post-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; R=$(printf %s \"${CLAUDE_PLUGIN_ROOT}\" | sed 's|^/\\([a-zA-Z]\\)/|\\1:/|'); node \"$R/scripts/pickwise.js\" tool-failed",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; R=$(printf %s \"${CLAUDE_PLUGIN_ROOT}\" | sed 's|^/\\([a-zA-Z]\\)/|\\1:/|'); node \"$R/scripts/pickwise.js\" tool-failed",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v node >/dev/null 2>&1 || exit 0; R=$(printf %s \"${CLAUDE_PLUGIN_ROOT}\" | sed 's|^/\\([a-zA-Z]\\)/|\\1:/|'); node \"$R/scripts/pickwise.js\" subagent-stop",
             "timeout": 10
           }
         ]
